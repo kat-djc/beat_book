@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtualenv (created by `make install`)
+.venv/
+
+# Environment
+.env
+
+# Caches
+.cache/
+.embeddings_cache.pkl
+
+# OS
+.DS_Store
+
+# Generated beat books
+output/
+
+# Scraped source stories
+source-stories-alt/
+source-stories/
+
+# Local size-cap test artifacts
+near_cap_test.txt
+oversize_test.txt
+
+# Research evaluation output
+evals/results/

@@ -1,0 +1,1223 @@
+"""
+agent.py
+--------
+Claude-powered agent (Sonnet 4.6) that has tools to explore stories/
+topics and produces a beat book without an interview stage.
+"""
+
+import asyncio
+import json
+import re
+import time
+from typing import Awaitable, Callable, Dict, List
+
+from pipeline import PipelineResult
+from chat_provider import (
+    ChatProvider,
+    ChatResponse,
+    ChatRateLimitError,
+    ChatConnectionError,
+    ChatServerError,
+    RATE_LIMIT_MAX_RETRIES,
+    retry_pause,
+    thinking_enabled,
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MODEL
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Model names are read from the ChatProvider at runtime.
+# For Anthropic: explore=Haiku, agent=Sonnet.
+# For Ollama: both use the configured OLLAMA_CHAT_MODEL.
+
+# Ceiling for the forced final-write turn. _final_max_tokens() scales up to
+# this based on the requested word target.
+MAX_TOKENS_FINAL_GENERATE = 16384
+# If the final write still hits max_tokens after this many continuation
+# rounds, save whatever was produced and warn instead of looping forever.
+MAX_FINAL_CONTINUATIONS = 3
+# Hard cap on any single tool result sent back to the model. Prevents one
+# large read_stories_in_topic call from flooding the context.
+MAX_TOOL_RESULT_CHARS = 60_000
+# When the conversation exceeds this many messages, old tool result turns
+# are replaced with a stub so the history stays within the 1M token limit.
+MAX_HISTORY_MESSAGES = 40
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL DEFINITIONS (Anthropic tool-use schema)
+# ─────────────────────────────────────────────────────────────────────────────
+
+TOOLS = [
+    {
+        "name": "view_topics",
+        "description": (
+            "View all discovered topics from the uploaded stories. Returns broad "
+            "and specific topics with story counts. Use this first to understand "
+            "the landscape of coverage."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "list_stories_in_topic",
+        "description": (
+            "List all stories that belong to a given topic. Returns story index, "
+            "title, and date for each."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "The exact topic label to look up.",
+                },
+            },
+            "required": ["topic"],
+        },
+    },
+    {
+        "name": "read_story",
+        "description": (
+            "Read the full content of a story by its index number. Returns title, "
+            "author, date, and full text."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "index": {
+                    "type": "integer",
+                    "description": "Zero-based story index.",
+                },
+            },
+            "required": ["index"],
+        },
+    },
+    {
+        "name": "read_stories_in_topic",
+        "description": (
+            "Read all stories in a topic at once — title, metadata, and a "
+            "content excerpt for every story in the topic in a single call. "
+            "Use this as your primary research tool: it satisfies the research "
+            "requirement for the topic in one call instead of N separate "
+            "read_story calls. After scanning, use read_story only if you need "
+            "the full text of a specific document."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "The exact topic label to scan.",
+                },
+            },
+            "required": ["topic"],
+        },
+    },
+    {
+        "name": "search_stories",
+        "description": (
+            "Search stories by keyword. Returns matching story indices, titles, "
+            "and dates."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keyword or phrase to search for in story titles and content.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "generate_beat_book",
+        "description": (
+            "Write the final beat book as a Markdown document. Call this once you "
+            "have gathered enough information from the topics, stories, and the "
+            "reporter's answers. The content you pass will be saved as the output file."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "markdown_content": {
+                    "type": "string",
+                    "description": "The complete beat book in Markdown format.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Descriptive filename based on the beat's topic, using snake_case and ending in _beat_book.md (e.g. 'chicago_immigration_enforcement_beat_book.md', 'bears_stadium_beat_book.md').",
+                },
+            },
+            "required": ["markdown_content", "filename"],
+        },
+    },
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SYSTEM PROMPT
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Document structure (shared by all styles) ──────────────────────────────
+
+_DOC_STRUCTURE = """\
+Structure the beat book as follows.
+
+Open with a **Beat Overview** of two or three paragraphs explaining what the \
+beat covers, the main institutions and processes involved, and the current \
+state of play. Ground it in specifics — the actual bills, agencies, disputes, \
+and time period in the corpus — rather than a thesis about the beat's \
+significance. State why the beat matters in plain, factual terms; do not \
+dramatize it. Move into **Key Topics & Themes**, organized \
+around the topics the reporter selected; each topic describes who is doing \
+what, what is at stake, and the recurring tension or arc in the coverage. \
+Cover **Key Sources & Players** — the people, organizations, and \
+institutions the coverage is ABOUT: officials, spokespeople, affected \
+parties, experts quoted on the substance, institutions taking action — \
+explaining their role and how they tend to surface. Do NOT include the \
+journalists or columnists who wrote the source stories themselves (their \
+bylines) — a byline appearing repeatedly across the corpus means one \
+reporter covers this beat often, not that they're a source or player in the \
+story. A journalist belongs here only if the coverage is actually about \
+them as a newsmaker (e.g. a reporter who is also a named party in a lawsuit \
+the beat covers) — covering the beat doesn't qualify. Include **Story Ideas \
+& Angles** — frame this as what still \
+needs follow-up and how a reporter might pursue it: the open questions the \
+coverage hasn't answered, the threads worth pulling, and practical next moves \
+(who to interview, what records or datasets to compare, which patterns to \
+test). Suggest approaches and angles — you are writing for a working reporter \
+who knows the craft, so do NOT dictate rote tasks or spell out obvious \
+mechanics (no "pull every docket number"). Provide **Background & Context**: \
+the history, policy, and institutional knowledge a new reporter would need. \
+End with **Reporting Tips** (practical advice specific to this beat, not \
+generic journalism advice) and a **Calendar & Recurring Events** section.\
+"""
+
+_NO_TOC = """\
+**Do NOT include a table of contents.** The viewer provides its own \
+navigation from the document's headings, so a TOC in the Markdown is \
+redundant. Start the document with the title and subtitle, then go directly \
+into the Beat Overview.\
+"""
+
+# ── Style presets ──────────────────────────────────────────────────────────
+
+# Core Simplified Technical English (STE) rules, applied to the styles meant
+# for fast scanning under pressure rather than narrative reading.
+_STE_RULES = """\
+Follow the core rules of Simplified Technical English (STE) in this style: \
+write short sentences, 20 words or fewer, never more than 25, with one idea \
+per sentence. Use active voice and name the actor — "The council voted to \
+cut funding," not "Funding was cut." Choose plain, common words over jargon \
+or elaborate vocabulary; once you pick a term for something, use that exact \
+term every time rather than varying it for style. Avoid long strings of \
+nouns stacked before a noun — write "how the school board voted on the \
+budget," not "school board budget vote outcome." Use simple verb tenses — \
+past for what happened, present for facts and current conditions — and \
+avoid compound or conditional constructions. Keep articles ("a," "the") in \
+place; do not drop them to save words. Avoid idioms, metaphors, and figures \
+of speech.\
+"""
+
+STYLE_PRESETS = {
+    "narrative": """\
+**Writing style.** Write in connected prose, the way a senior reporter would \
+brief a colleague picking up the beat — not as an outline. Use bullets only \
+for genuinely list-shaped content: a roster of named sources, a short list \
+of story ideas, a calendar. Do NOT create per-topic sub-headers like \
+"What's happening / Key story / Story angles" — let the prose carry the \
+structure. Write complete sentences with concrete subjects and verbs ("The \
+school board voted 6-1 last March to raise property taxes" — not "School \
+board: 6-1 vote, March, property tax increase"). Reference actual stories, \
+names, and details from the corpus, not generic advice. Keep the register \
+plain and workmanlike. Avoid grand framing and dramatic metaphor — no "sits \
+at the intersection of," no "gravitational pull," no "hangs over every \
+vote," no pronouncements about what "understanding this beat means." Open \
+paragraphs with concrete facts, not sweeping thesis statements about \
+significance or scale. The prose can have voice, but it should inform \
+rather than build drama. The result should read like a veteran reporter's \
+guide to the fundamentals of the beat — clear, grounded, and useful enough \
+that a brand-new reporter could pick it up and start producing informed \
+coverage the same day.\
+""",
+
+    "scannable": """\
+**Writing style.** Optimize for quick reference. Keep paragraphs short \
+(2–3 sentences). Open each topic section with a **bolded lead sentence** \
+that states the single most important thing, then use bullet points for \
+supporting details. Per-topic sub-headers (e.g. "Key players", "What to \
+watch") are encouraged — they help a reporter scan. Bold key names, \
+organizations, and institutions on first mention. Use complete sentences \
+with concrete subjects and verbs, and reference actual stories, names, and \
+details from the corpus. A reporter should be able to flip to any section \
+and find what they need in seconds.
+
+""" + _STE_RULES,
+
+    "briefing": """\
+**Writing style.** Write like an editor's desk memo — terse, direct, and \
+action-oriented. Use present tense and imperative mood where it fits \
+("Watch for…", "Talk to…", "The key number is…"). Paragraphs are 2–3 \
+sentences max. Each section opens with the single most important takeaway, \
+then supporting detail. Prioritize actionable intelligence over background: \
+who to call, what to FOIA, which meetings to attend, what numbers to track. \
+The **Background & Context** section should cover only what a reporter \
+needs this week — skip deep history unless it directly informs current \
+coverage. Reference actual stories, names, and details from the corpus. \
+The result should read like a senior editor handing a beat folder to a \
+reporter walking out the door.
+
+""" + _STE_RULES,
+}
+
+VALID_STYLES = list(STYLE_PRESETS.keys())
+
+# ── Length control ───────────────────────────────────────────────────────────
+# Named length presets → approximate total word target. The chosen target is
+# injected into the doc spec as a hard-ish budget and also scales the final
+# write's max_tokens so a shorter book is both requested and cheaper/faster.
+DEFAULT_TARGET_WORDS = 2000
+LENGTH_PRESETS = {
+    "brief": 1000,
+    "standard": 2000,
+    "indepth": 3500,
+}
+
+
+def _clamp_target_words(target_words: int | None) -> int:
+    if not target_words or target_words <= 0:
+        return DEFAULT_TARGET_WORDS
+    # Keep within sane bounds regardless of caller input.
+    return max(500, min(6000, int(target_words)))
+
+
+# Each section's share of the word target. Models hold to a budget per
+# section far better than to one total: DeepSeek wrote 1.5 to 2.8 times the
+# target when given only the total.
+SECTION_SHARES = [
+    ("Beat Overview", 0.12),
+    ("Key Topics & Themes", 0.30),
+    ("Key Sources & Players", 0.15),
+    ("Story Ideas & Angles", 0.13),
+    ("Background & Context", 0.13),
+    ("Reporting Tips", 0.09),
+    ("Calendar & Recurring Events", 0.08),
+]
+
+
+def section_budgets(target_words: int) -> List[tuple]:
+    """(section, words) for each section, rounded to 10 words."""
+    return [(name, max(30, int(round(target_words * share / 10.0)) * 10)) for name, share in SECTION_SHARES]
+
+
+def _length_directive(target_words: int) -> str:
+    max_words = int(target_words * 1.3)
+    budgets = "; ".join(f"{name} about {words:,}" for name, words in section_budgets(target_words))
+    return (
+        f"**Length.** Aim for roughly {target_words:,} words across the whole "
+        f"document — treat this as a target to hit, not a floor to exceed. Be "
+        f"concise: cover the beat well within that budget rather than exhausting "
+        f"every detail, and if the corpus is thin it is fine to come in under. "
+        f"Prioritize what a reporter most needs and cut anything that reads as "
+        f"filler. Do not exceed {max_words:,} words under any circumstances. "
+        f"Word budget by section: {budgets}. Keep each section within its "
+        f"budget; when a section runs long, cut its least important details "
+        f"rather than taking words from another section."
+    )
+
+
+def _final_max_tokens(target_words: int) -> int:
+    """Scale the final-write token ceiling to the word target, with generous
+    headroom so a moderate overrun doesn't truncate the document mid-turn."""
+    return max(4096, min(MAX_TOKENS_FINAL_GENERATE, int(target_words * 3) + 1500))
+
+
+def _build_doc_spec(style: str = "narrative",
+                    target_words: int = DEFAULT_TARGET_WORDS) -> str:
+    style_text = STYLE_PRESETS.get(style, STYLE_PRESETS["narrative"])
+    length_text = _length_directive(target_words)
+    return f"{_DOC_STRUCTURE}\n\n{length_text}\n\n{style_text}\n\n{_NO_TOC}"
+
+
+# ── System prompt templates ────────────────────────────────────────────────
+
+_EXPLORE_TEMPLATE = """\
+You are an expert journalism mentor and beat-book author. Your job is to help \
+a reporter create a comprehensive "beat book" — a practical reporting guide for \
+covering a specific beat (topic area).
+
+You have been given a set of news stories that the reporter has uploaded. These \
+stories have already been analyzed and grouped into topics automatically.
+
+Your workflow:
+1. **Scan** — Call `view_topics` to see the full topic list. Then call \
+`read_stories_in_topic` for each topic — it returns every story with a \
+2000-character excerpt so you can survey the landscape.
+2. **Deep read** — After scanning, call `read_story` on individual stories \
+to get their full text. Prioritize stories that appear most important, cover \
+different angles, or cite unique sources. The `[Research progress]` block in \
+every tool result shows per-topic read counts — keep calling `read_story` \
+until every topic shows "OK". A scan alone is not enough; you need deep reads.
+3. **Generate** — Call `generate_beat_book` once every topic shows "OK" in \
+the progress block.
+
+{doc_spec}
+
+Keep your conversational messages concise. Use tools frequently.\
+"""
+
+# The final-write prompt avoids the "call generate_beat_book" instruction
+# that conflicts with tool_choice="none".
+_WRITE_TEMPLATE = """\
+You are an expert journalism mentor and beat-book author. You have finished \
+researching a set of news stories on behalf of a reporter, and your research \
+notes are in the conversation above. Your only job now is to write the \
+complete beat book.
+
+Reply with ONLY the finished Markdown document — no preamble, no \
+acknowledgement, no tool calls. Start directly with the title (`# ...`).
+
+{doc_spec}\
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOCAL TOOL EXECUTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _target_for_topic(topic_size: int) -> int:
+    """A topic's starting read count: every story for small topics (<8),
+    otherwise a third (rounded up), capped at 10. read_targets adjusts these
+    to a budget for the whole book."""
+    if topic_size < 8:
+        return topic_size
+    return min(10, (topic_size + 2) // 3)
+
+
+# Full reads for the whole book: at least a quarter of the stories (and at
+# least READ_BUDGET_MIN), at most READ_BUDGET_MAX. Per-topic targets alone
+# gave a 73-story corpus that clustered into one topic just 10 reads, and
+# nine small topics would ask for about 40, more than an Ollama model's
+# 64K-token context holds alongside the topic scans.
+READ_BUDGET_MIN = 10
+READ_BUDGET_MAX = 20
+
+
+def read_targets(topics: Dict[str, List[int]]) -> Dict[str, int]:
+    """Read target per topic. The per-topic starting counts are scaled to
+    the book's budget, shared out by topic size, never above a topic's size
+    and never below one read per topic."""
+    sizes = {t: len(ix) for t, ix in topics.items() if ix}
+    if not sizes:
+        return {}
+    base = {t: _target_for_topic(n) for t, n in sizes.items()}
+    stories = len({i for ix in topics.values() for i in ix})
+    floor = min(stories, max(READ_BUDGET_MIN, -(-stories // 4)))
+    budget = min(READ_BUDGET_MAX, max(sum(base.values()), floor))
+    budget = min(budget, sum(sizes.values()))
+    if sum(base.values()) == budget:
+        return base
+    # Share the budget by size (largest remainder), capped by each topic's size.
+    total = sum(sizes.values())
+    raw = {t: budget * n / total for t, n in sizes.items()}
+    out = {t: max(1, min(sizes[t], int(raw[t]))) for t in sizes}
+    order = sorted(sizes, key=lambda t: raw[t] - int(raw[t]), reverse=True)
+    while sum(out.values()) < budget:
+        grew = False
+        for t in order:
+            if sum(out.values()) >= budget:
+                break
+            if out[t] < sizes[t]:
+                out[t] += 1
+                grew = True
+        if not grew:
+            break
+    return out
+
+
+# The draft must start at its "# Title" line. Some models on Ollama (GLM-5.3)
+# ignore "think": false and write their deliberation into the answer itself,
+# untagged, then glue the real answer onto the end of it:
+# "...so I should just give the label.City Budget Vote". A draft would open
+# with paragraphs of reasoning that citation matching then counts as claims.
+_TITLE_AT_LINE_START = re.compile(r"(?m)^#[ \t]+\S")
+# A title glued onto the end of a sentence ("...the title.# CHA Beat Book").
+# Only after sentence punctuation or a closing bracket, never after a quote
+# mark or backtick: reasoning that quotes the instruction ("start with
+# "# Title"") is not the book.
+_TITLE_GLUED_TO_TEXT = re.compile(r"(?<=[.!?:)\]])[ \t]*(#[ \t]+\S)")
+_ANY_HEADING = re.compile(r"(?m)^#{1,3}[ \t]+\S")
+_HEADING_LINE = re.compile(r"^\s*#{1,6}[ \t]+\S")
+# A real title reaches prose within a few headings; an outline sketched in
+# the model's reasoning ("# Title / ## Beat Overview / ## Key Topics ...")
+# is headings with nothing under them.
+MAX_HEADINGS_BEFORE_PROSE = 3
+MIN_PROSE_CHARS = 25
+# A title is a line, not a paragraph: "# Title", that's not continuing the
+# planning notes ..." is reasoning that happens to start with "# ".
+MAX_TITLE_CHARS = 120
+
+
+def _starts_a_book(text: str, i: int) -> bool:
+    if len(text[i:].split("\n", 1)[0].strip()) > MAX_TITLE_CHARS:
+        return False
+    headings = 0
+    for line in text[i:i + 6000].split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped in ("---", "***"):
+            continue
+        if _HEADING_LINE.match(stripped):
+            headings += 1
+            if headings > MAX_HEADINGS_BEFORE_PROSE:
+                return False
+            continue
+        if len(stripped) >= MIN_PROSE_CHARS:
+            return True
+    return False
+
+
+def strip_preamble(markdown: str) -> tuple[str, str]:
+    """Split a draft into (book, preamble): everything before its title is
+    preamble. The title is the first "# " heading, at a line start or glued
+    onto the end of a sentence, that is followed by prose within a few
+    headings; failing that, the first "##" or "###" heading that is. A
+    draft with no such heading is returned unchanged."""
+    text = markdown or ""
+    candidates = sorted({m.start() for m in _TITLE_AT_LINE_START.finditer(text)}
+                        | {g.start(1) for g in _TITLE_GLUED_TO_TEXT.finditer(text)})
+    starts = [i for i in candidates if _starts_a_book(text, i)]
+    if not starts:
+        starts = [h.start() for h in _ANY_HEADING.finditer(text) if _starts_a_book(text, h.start())][:1]
+    if not starts or starts[0] == 0:
+        return text, ""
+    i = starts[0]
+    return text[i:].lstrip(), text[:i].strip()
+
+
+def _without_preamble(on_beat_book, on_message):
+    """Wrap the draft callback so every draft reaches it without model
+    preamble, and say so on the progress feed when some was cut."""
+    async def hand_off(filename: str, markdown: str) -> None:
+        book, preamble = strip_preamble(markdown)
+        if preamble:
+            print(f"[agent] removed {len(preamble)} characters before the draft's title: "
+                  f"{preamble[:200]!r}", flush=True)
+            await on_message(
+                f"Removed {len(preamble):,} characters the model wrote before the beat "
+                "book's title (its own reasoning, not part of the book)."
+            )
+        await on_beat_book(filename, book)
+    return hand_off
+
+
+def _derive_filename(pipeline_result: PipelineResult) -> str:
+    """Build a descriptive snake_case filename from the top broad topic."""
+    import re
+    topics = sorted(
+        pipeline_result.broad_topics.items(),
+        key=lambda x: -len(x[1]),
+    )
+    if not topics:
+        return "beat_book.md"
+    label = topics[0][0].lower()
+    words = re.sub(r"[^a-z0-9]+", " ", label).split()
+    words = words[:3]
+    if not words:
+        return "beat_book.md"
+    return "_".join(words) + "_beat_book.md"
+
+
+def _progress_report(
+    pipeline_result: PipelineResult,
+    listed_topics: set,
+    read_indices: set,
+) -> tuple[str, bool]:
+    """Format the agent's research progress, plus a boolean telling whether
+    every listed topic has reached its read-count target. The boolean drives
+    the generate_beat_book gate."""
+    if not listed_topics:
+        return (
+            "[Research progress] No topics listed yet. Call list_stories_in_topic "
+            "for each topic the reporter selected to start exploring.",
+            False,
+        )
+
+    lines = ["[Research progress]"]
+    all_met = True
+    targets = read_targets(pipeline_result.topics)
+    for topic in sorted(listed_topics):
+        indices = pipeline_result.topics.get(topic, [])
+        if not indices:
+            continue
+        total = len(indices)
+        read = sum(1 for i in indices if i in read_indices)
+        target = targets.get(topic, _target_for_topic(total))
+        met = read >= target
+        if not met:
+            all_met = False
+        marker = "OK" if met else "needs more"
+        lines.append(
+            f"  - {topic}: {read}/{total} read (target {target}) — {marker}"
+        )
+    lines.append(
+        f"Total stories read (unique): {len(read_indices)}. "
+        f"Targets add up to {sum(targets.values())} full reads for the book: about "
+        f"a quarter of the stories, at least {READ_BUDGET_MIN} and at most "
+        f"{READ_BUDGET_MAX}, shared across topics by size. Only full reads with "
+        "read_story count; scanning a topic with read_stories_in_topic shows "
+        "excerpts and does not count."
+    )
+    if not all_met:
+        lines.append(
+            "generate_beat_book will be rejected until every listed topic "
+            "meets its target. Call read_story on individual stories to "
+            "increase your read count."
+        )
+    return "\n".join(lines), all_met
+
+
+def execute_local_tool(name: str, input_data: dict, result: PipelineResult) -> str:
+    """Execute a non-interactive tool and return a string result."""
+    if name == "view_topics":
+        return result.topic_summary()
+
+    if name == "list_stories_in_topic":
+        stories = result.stories_for_topic(input_data["topic"])
+        if not stories:
+            return f"No stories found for topic '{input_data['topic']}'. Check exact spelling."
+        return json.dumps(stories, indent=2)
+
+    if name == "read_story":
+        idx = input_data.get("index")
+        story = result.get_story(idx) if isinstance(idx, int) else None
+        if not story:
+            if isinstance(idx, int) and 0 <= idx < len(result.stories):
+                return (f"Story {idx} is outside the topics the reporter selected. "
+                        "Use list_stories_in_topic to find stories in scope.")
+            return f"Invalid index {idx}. Valid range: 0–{len(result.stories)-1}."
+        in_scope_topics = [t for t in result.story_topics[idx] if t in result.topics]
+        return json.dumps({
+            "index": idx,
+            "title": story.get("title", ""),
+            "author": story.get("author", ""),
+            "date": story.get("date", ""),
+            "topics": in_scope_topics,
+            "content": story.get("content", "")[:4000],
+        }, indent=2)
+
+    if name == "read_stories_in_topic":
+        topic = input_data.get("topic", "")
+        indices = result.topics.get(topic, [])
+        if not indices:
+            return f"No stories found for topic '{topic}'. Check exact spelling."
+        entries = []
+        for i in indices:
+            story = result.get_story(i)
+            if not story:
+                continue
+            entries.append({
+                "index": i,
+                "title": story.get("title", ""),
+                "date": story.get("date", ""),
+                "author": story.get("author", ""),
+                "organization": story.get("organization", ""),
+                "content_type": story.get("content_type", "article"),
+                "metadata": story.get("metadata", {}),
+                "excerpt": story.get("content", "")[:2000],
+            })
+        return json.dumps(entries, indent=2)
+
+    if name == "search_stories":
+        matches = result.search_stories(input_data["query"])
+        if not matches:
+            return f"No stories matching '{input_data['query']}'."
+        return json.dumps(matches, indent=2)
+
+    return f"Unknown tool: {name}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENT LOOP
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Type for the callback that sends agent text messages to the frontend
+MessageCallback   = Callable[[str], Awaitable[None]]
+# Type for the callback that reports tool execution status. The final `int`
+# is the number of distinct stories this call covers (0 when not applicable),
+# so callers can track real corpus coverage instead of raw call counts.
+ToolStatusCallback = Callable[[str, str, str, int], Awaitable[None]]
+
+
+# Human-friendly descriptions for each tool
+TOOL_DESCRIPTIONS = {
+    "view_topics": "Reviewing discovered topics",
+    "list_stories_in_topic": "Listing stories in topic",
+    "read_stories_in_topic": "Scanning all stories in topic",
+    "read_story": "Reading a story",
+    "search_stories": "Searching stories",
+    "generate_beat_book": "Writing the beat book",
+}
+
+
+def _cap_tool_result(content: str) -> str:
+    if len(content) <= MAX_TOOL_RESULT_CHARS:
+        return content
+    return content[:MAX_TOOL_RESULT_CHARS] + (
+        f"\n\n[Truncated: result was {len(content):,} chars; "
+        f"showing first {MAX_TOOL_RESULT_CHARS:,}. "
+        "Use read_story with specific indices for full content.]"
+    )
+
+
+def _prune_history(messages: list) -> list:
+    """Replace the content of old tool-result turns with a stub once the
+    conversation grows past MAX_HISTORY_MESSAGES, keeping the most recent
+    turns intact so the model retains full context of recent work."""
+    if len(messages) <= MAX_HISTORY_MESSAGES:
+        return messages
+    # Keep the first message (initial user prompt) and the most recent half.
+    keep_tail = MAX_HISTORY_MESSAGES // 2
+    pruned = []
+    for i, msg in enumerate(messages):
+        if i == 0 or i >= len(messages) - keep_tail:
+            pruned.append(msg)
+        elif msg.get("role") == "user" and isinstance(msg.get("content"), list):
+            # Replace tool result content with stubs to free token budget.
+            stubbed = []
+            for block in msg["content"]:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    stubbed.append({**block, "content": "[earlier result omitted to save context]"})
+                else:
+                    stubbed.append(block)
+            pruned.append({**msg, "content": stubbed})
+        else:
+            pruned.append(msg)
+    return pruned
+
+
+async def run_agent(
+    pipeline_result: PipelineResult,
+    provider: ChatProvider,
+    on_message: MessageCallback,
+    on_beat_book: Callable[[str, str], Awaitable[None]],
+    on_tool_status: ToolStatusCallback = None,
+    on_heartbeat: Callable[[], Awaitable[None]] = None,
+    on_agent_progress: Callable[[float, str], Awaitable[None]] = None,
+    on_exploration_done: Callable[[str], Awaitable[None]] = None,
+    selected_topics: list[str] | None = None,
+    style: str = "narrative",
+    target_words: int = DEFAULT_TARGET_WORDS,
+    trace: dict | None = None,
+) -> None:
+    """
+    Run the agent loop.
+
+    Args:
+        pipeline_result: Output from the embedding/clustering pipeline.
+        provider: ChatProvider instance (Anthropic or Ollama).
+        on_message: async callback(text) — sends agent text to the frontend.
+        on_beat_book: async callback(filename, markdown) — saves/delivers the beat book.
+        on_tool_status: async callback(tool_name, desc, detail, story_count) — reports
+            tool execution status; story_count is the number of distinct stories the
+            call covers (0 when not applicable).
+        on_heartbeat: optional async callback fired every ~15s during API calls
+                      to keep the WebSocket connection alive.
+        trace: optional dict the loop fills in with a record of the run —
+               models, prompts, every model call's token usage, every tool
+               call, and the stories actually read. jobs.py writes it into the
+               book's manifest so the reporter can see how the book was made.
+    """
+    if trace is None:
+        trace = {}
+    target_words = _clamp_target_words(target_words)
+    final_max_tokens = _final_max_tokens(target_words)
+    doc_spec = _build_doc_spec(style, target_words)
+    system_prompt = _EXPLORE_TEMPLATE.format(doc_spec=doc_spec)
+    write_system_prompt = _WRITE_TEMPLATE.format(doc_spec=doc_spec)
+
+    trace.update({
+        "explore_model": provider.explore_model,
+        "write_model": provider.agent_model,
+        "style": style,
+        "target_words": target_words,
+        "explore_system_prompt": system_prompt,
+        "write_system_prompt": write_system_prompt,
+        "model_calls": [],
+        "tool_calls": [],
+        "stories_read": [],
+        "topics_listed": [],
+        "final_write": {},
+    })
+
+    async def _api_call_with_heartbeat(**kwargs) -> ChatResponse:
+        """Run the provider call in a thread while sending heartbeats
+        every 15 seconds so the WebSocket doesn't time out during long turns."""
+        api_task = asyncio.create_task(
+            asyncio.to_thread(provider.create, **kwargs)
+        )
+        while not api_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(api_task), timeout=15)
+            except asyncio.TimeoutError:
+                if on_heartbeat:
+                    try:
+                        await on_heartbeat()
+                    except Exception:
+                        pass
+            except Exception:
+                break
+        return await api_task
+
+    async def _call_with_retries(request_kwargs: dict) -> ChatResponse | None:
+        """Call the provider with rate-limit/connection/server-error retries.
+        Returns None (after notifying the user) once retries are exhausted
+        on a rate-limit or connection error; re-raises on a persistent
+        server error. Callers must treat a None return as "stop the agent
+        loop"."""
+        for rl_attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+            try:
+                print(f"[agent] turn {_turn}: calling "
+                      f"{request_kwargs['model']} "
+                      f"(force_generate={force_generate}, "
+                      f"max_tokens={request_kwargs['max_tokens']}, "
+                      f"messages={len(request_kwargs['messages'])})", flush=True)
+                response = await _api_call_with_heartbeat(**request_kwargs)
+                trace["model_calls"].append({
+                    "t": round(time.time(), 1),
+                    "turn": _turn,
+                    "model": request_kwargs["model"],
+                    "phase": "write" if force_generate else "explore",
+                    "stop_reason": response.stop_reason,
+                    "usage": dict(response.usage or {}),
+                })
+                print(f"[agent] turn {_turn}: stop_reason={response.stop_reason} "
+                      f"blocks={[b.get('type') for b in response.content]} "
+                      f"usage={response.usage}",
+                      flush=True)
+                return response
+            except ChatRateLimitError as e:
+                if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
+                    await on_message(
+                        "⚠️ Rate limit persistently exceeded — please wait "
+                        "a few minutes and start a new session."
+                    )
+                    return None
+                pause = retry_pause(rl_attempt, e)
+                await on_message(
+                    f"⏸ Hit rate limit. Waiting {pause:.0f}s before retrying "
+                    f"(attempt {rl_attempt + 1}/{RATE_LIMIT_MAX_RETRIES})…"
+                )
+                await asyncio.sleep(pause)
+            except ChatConnectionError as e:
+                if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
+                    await on_message(
+                        f"⚠️ Connection kept failing ({e}). "
+                        "Please check your network and start a new session."
+                    )
+                    return None
+                pause = min(30.0, 5.0 * (2 ** rl_attempt))
+                await on_message(
+                    f"⏸ Connection error ({e}). "
+                    f"Retrying in {pause:.0f}s "
+                    f"(attempt {rl_attempt + 1}/{RATE_LIMIT_MAX_RETRIES})…"
+                )
+                await asyncio.sleep(pause)
+            except ChatServerError as e:
+                if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
+                    raise
+                pause = min(30.0, 5.0 * (2 ** rl_attempt))
+                await on_message(
+                    f"⏸ Server error. Retrying in "
+                    f"{pause:.0f}s (attempt {rl_attempt + 1}/"
+                    f"{RATE_LIMIT_MAX_RETRIES})…"
+                )
+                await asyncio.sleep(pause)
+        return None
+
+    # Restrict to reporter-selected topics if provided.
+    # view_topics reads broad_topics and read_story/search_stories used to
+    # reach the whole corpus, so all three are scoped here — otherwise the
+    # agent still sees, and writes about, topics the reporter deselected.
+    if selected_topics:
+        from dataclasses import replace as _replace
+        wanted = set(selected_topics)
+        filtered = {t: v for t, v in pipeline_result.topics.items() if t in wanted}
+        allowed = frozenset(i for v in filtered.values() for i in v)
+        pipeline_result = _replace(
+            pipeline_result,
+            topics=filtered,
+            broad_topics={t: v for t, v in pipeline_result.broad_topics.items() if t in wanted},
+            allowed_indices=allowed,
+        )
+
+    if pipeline_result.allowed_indices is not None:
+        n_stories = len(pipeline_result.allowed_indices)
+    else:
+        n_stories = len(pipeline_result.stories)
+    trace["selected_topics"] = list(pipeline_result.topics.keys())
+    trace["stories_in_scope"] = n_stories
+    trace["read_targets"] = read_targets(pipeline_result.topics)
+    n_topics  = len(pipeline_result.topics)
+
+    messages: list[dict] = [
+        {
+            "role": "user",
+            "content": (
+                f"I've uploaded {n_stories} news stories. The system has automatically "
+                f"discovered {n_topics} topics across them. Please build a comprehensive "
+                "beat book from these stories. Start by exploring the topics, read all "
+                "of them, then generate the beat book."
+            ),
+        },
+    ]
+
+    last_message_text = ""
+    beat_book_done = False
+    on_beat_book = _without_preamble(on_beat_book, on_message)   # see strip_preamble
+
+    # Research-progress tracking. listed_topics is the set of topic labels the
+    # agent has called list_stories_in_topic on (a proxy for "topics the
+    # reporter selected"); read_indices is the set of story indices the
+    # agent has read via read_story. Both feed _progress_report, which is
+    # surfaced in every local tool result AND used to gate generate_beat_book.
+    listed_topics: set = set()
+    read_indices: set = set()       # read in full with read_story
+    scanned_indices: set = set()    # seen only as excerpts via read_stories_in_topic
+
+    exploration_fired = False
+
+    def _finish_trace():
+        trace["stories_read"] = [
+            {"index": i, "title": pipeline_result.stories[i].get("title", "")}
+            for i in sorted(read_indices)
+        ]
+        trace["stories_scanned_only"] = [
+            {"index": i, "title": pipeline_result.stories[i].get("title", "")}
+            for i in sorted(scanned_indices - read_indices)
+        ]
+        trace["topics_listed"] = sorted(listed_topics)
+        trace["turns"] = _turn + 1
+
+    MAX_TURNS = 40
+    _turn = 0
+    for _turn in range(MAX_TURNS):
+        messages = _prune_history(messages)
+
+        # Once coverage is met, FORCE the model to call generate_beat_book.
+        # Without forced tool_choice, Sonnet often narrates "I've reviewed
+        # everything" and ends the turn instead of producing the book.
+        _, threshold_met = _progress_report(
+            pipeline_result, listed_topics, read_indices,
+        )
+        force_generate = threshold_met and not beat_book_done
+        if force_generate and on_exploration_done and not exploration_fired:
+            exploration_fired = True
+            # Build a context doc with topic summaries + story excerpts for
+            # the research agent to start on in parallel.
+            context_lines = ["# Beat Book Research Context\n"]
+            for topic, indices in pipeline_result.topics.items():
+                context_lines.append(f"## {topic}\n")
+                for i in list(indices)[:6]:
+                    s = pipeline_result.get_story(i)
+                    if s:
+                        excerpt = " ".join(s.get("content", "").split()[:60])
+                        context_lines.append(f"- **{s.get('title','')}** — {excerpt}\n")
+                context_lines.append("")
+            context_doc = "\n".join(context_lines)
+            try:
+                await on_exploration_done(context_doc)
+            except Exception:
+                pass
+        if force_generate:
+            print(f"[agent] turn {_turn}: forcing generate_beat_book "
+                  f"(listed={len(listed_topics)}/{len(pipeline_result.topics)}, "
+                  f"read={len(read_indices)}/{len(pipeline_result.stories)})",
+                  flush=True)
+            if on_tool_status:
+                await on_tool_status(
+                    "generate_beat_book",
+                    "Writing the beat book",
+                    "Drafting the full Markdown — this takes 1–3 minutes…",
+                    0,
+                )
+            if on_agent_progress:
+                await on_agent_progress(100, "Writing the beat book")
+            await on_message(
+                "Coverage target met — writing the beat book now. "
+                "This step takes 1–3 minutes."
+            )
+        # Provider call blocks; offload to a worker thread so the
+        # WebSocket handler stays responsive. throttle=False: this is the
+        # interactive path — it must never queue behind background ingest
+        # normalization or cluster labeling (see AnthropicChatProvider.create).
+        if force_generate:
+            write_messages = list(messages) + [
+                {
+                    "role": "user",
+                    "content": (
+                        "Now write the full beat book in Markdown. "
+                        "The exploration phase is over and tools are "
+                        "disabled — the earlier instruction to call "
+                        "tools no longer applies. Reply with ONLY "
+                        "the Markdown document — no preamble, no "
+                        "acknowledgement. Start directly with the "
+                        "title (`# ...`)."
+                    ),
+                },
+            ]
+            request_kwargs = dict(
+                model=provider.agent_model,
+                max_tokens=final_max_tokens,
+                system=write_system_prompt,
+                tools=TOOLS,
+                tool_choice={"type": "none"},
+                messages=write_messages,
+                think=thinking_enabled(),
+                throttle=False,
+            )
+            response = await _call_with_retries(request_kwargs)
+            if response is None:
+                return
+
+            # The final write can hit the token ceiling mid-document. Ask the
+            # model to continue rather than silently saving a truncated book.
+            text_parts = [response.text]
+            continuation_round = 0
+            while (response.stop_reason == "max_tokens"
+                   and continuation_round < MAX_FINAL_CONTINUATIONS):
+                continuation_round += 1
+                await on_message(
+                    f"Output hit the token limit — continuing the beat book "
+                    f"(round {continuation_round}/{MAX_FINAL_CONTINUATIONS})…"
+                )
+                write_messages = write_messages + [
+                    {"role": "assistant", "content": response.content},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your response was cut off by the token limit. "
+                            "Continue the Markdown document EXACTLY where it "
+                            "stopped — resume mid-sentence or mid-word if "
+                            "needed, do not repeat any text you already "
+                            "wrote, and do not add any preamble."
+                        ),
+                    },
+                ]
+                request_kwargs = dict(request_kwargs, messages=write_messages)
+                response = await _call_with_retries(request_kwargs)
+                if response is None:
+                    return
+                text_parts.append(response.text)
+
+            text_combined = "".join(text_parts).strip()
+
+            if response.stop_reason == "max_tokens":
+                await on_message(
+                    "⚠️ The model hit its output limit mid-turn even after "
+                    f"{MAX_FINAL_CONTINUATIONS} continuation attempts. The "
+                    "beat book may be incomplete."
+                )
+
+            trace["final_write"] = {
+                "continuation_rounds": continuation_round,
+                "truncated": response.stop_reason == "max_tokens",
+                "chars": len(text_combined),
+            }
+            # Final-write turn: the text body IS the beat book.
+            if text_combined:
+                _finish_trace()
+                await on_beat_book(_derive_filename(pipeline_result), text_combined)
+                beat_book_done = True
+                break
+            else:
+                await on_message(
+                    "⚠️ The model returned no Markdown on the final write. "
+                    "Try again."
+                )
+                break
+
+        request_kwargs = dict(
+            model=provider.explore_model,
+            max_tokens=4096,
+            system=system_prompt,
+            tools=TOOLS,
+            messages=messages,
+            throttle=False,
+        )
+        response = await _call_with_retries(request_kwargs)
+        if response is None:
+            return
+
+        text_combined = response.text.strip()
+
+        if text_combined and text_combined != last_message_text:
+            await on_message(text_combined)
+            last_message_text = text_combined
+
+        stop_reason = response.stop_reason
+
+        # No tool use this turn = end of conversation, or we already wrote
+        # the beat book on the prior turn.
+        if stop_reason != "tool_use":
+            if stop_reason == "max_tokens":
+                await on_message(
+                    "⚠️ The model hit its output limit mid-turn. The beat book "
+                    "may be incomplete. Please try again with a tighter scope."
+                )
+                break
+            if beat_book_done:
+                break
+            # Agent stopped narrating without calling generate_beat_book.
+            # Push it forward instead of silently dropping the session.
+            _, threshold_met = _progress_report(
+                pipeline_result, listed_topics, read_indices,
+            )
+            messages.append({"role": "assistant", "content": response.content})
+            if threshold_met:
+                nudge = (
+                    "You have met the coverage target on every listed topic. "
+                    "Call `generate_beat_book` NOW with the full Markdown. "
+                    "Do not reply with text — call the tool."
+                )
+            else:
+                nudge = (
+                    "You stopped without calling a tool. Continue exploring: "
+                    "use `read_stories_in_topic` on topics that still show "
+                    "'needs more', then call `generate_beat_book`. Do not "
+                    "reply with prose — call a tool."
+                )
+            messages.append({"role": "user", "content": nudge})
+            continue
+        if beat_book_done:
+            break
+
+        # Preserve the full assistant content (text + thinking + tool_use)
+        # verbatim so the next request stays coherent.
+        messages.append({"role": "assistant", "content": response.content})
+
+        tool_results: list[dict] = []
+        for block in response.content:
+            if block.get("type") != "tool_use":
+                continue
+
+            tool_name = block["name"]
+            tool_id = block["id"]
+            tool_input = block.get("input", {})
+
+            # Report tool status to the frontend
+            if on_tool_status:
+                desc = TOOL_DESCRIPTIONS.get(tool_name, tool_name)
+                detail = ""
+                story_count = 0
+                if tool_name == "read_stories_in_topic":
+                    topic = tool_input.get("topic", "")
+                    detail = topic
+                    story_count = len(pipeline_result.topics.get(topic, []))
+                elif tool_name == "list_stories_in_topic":
+                    detail = tool_input.get("topic", "")
+                elif tool_name == "read_story":
+                    idx = tool_input.get("index", "")
+                    story = pipeline_result.get_story(idx) if isinstance(idx, int) else None
+                    detail = story.get("title", f"#{idx}")[:60] if story else f"#{idx}"
+                    story_count = 1
+                elif tool_name == "search_stories":
+                    detail = tool_input.get("query", "")
+                await on_tool_status(tool_name, desc, detail, story_count)
+
+            if tool_name == "generate_beat_book":
+                progress, threshold_met = _progress_report(
+                    pipeline_result, listed_topics, read_indices,
+                )
+                if not threshold_met:
+                    content_str = (
+                        "generate_beat_book REJECTED — research is incomplete.\n\n"
+                        f"{progress}\n\n"
+                        "Continue using list_stories_in_topic (for any topics you "
+                        "haven't listed yet) and read_story to bring every listed "
+                        "topic up to its target, then call generate_beat_book again. "
+                        "Do not stop — the user will get no beat book if you abandon "
+                        "the loop now."
+                    )
+                else:
+                    _finish_trace()
+                    trace["final_write"] = {"via_tool": True}
+                    await on_beat_book(
+                        tool_input.get("filename", "beat_book.md"),
+                        tool_input.get("markdown_content", ""),
+                    )
+                    content_str = "Beat book saved successfully. You may now give a brief closing message."
+                    beat_book_done = True
+
+            else:
+                content_str = execute_local_tool(tool_name, tool_input, pipeline_result)
+                # Track research progress and append a status block so the
+                # model can self-check against the per-topic targets.
+                if tool_name == "list_stories_in_topic":
+                    topic = tool_input.get("topic", "")
+                    if topic and topic in pipeline_result.topics:
+                        listed_topics.add(topic)
+                elif tool_name == "read_stories_in_topic":
+                    # A scan returns 2,000-character excerpts. It used to credit
+                    # five reads per topic, which met small targets outright:
+                    # books were written without a single full story read.
+                    topic = tool_input.get("topic", "")
+                    if topic and topic in pipeline_result.topics:
+                        listed_topics.add(topic)
+                        scanned_indices.update(pipeline_result.topics[topic])
+                elif tool_name == "read_story":
+                    idx = tool_input.get("index")
+                    if isinstance(idx, int) and pipeline_result.get_story(idx) is not None:
+                        read_indices.add(idx)
+                progress, _ = _progress_report(
+                    pipeline_result, listed_topics, read_indices,
+                )
+                content_str = f"{content_str}\n\n{progress}"
+
+                if on_agent_progress:
+                    total_topics = len(pipeline_result.topics) or 1
+                    topic_pct = 0.0
+                    targets = read_targets(pipeline_result.topics)
+                    for topic, indices in pipeline_result.topics.items():
+                        if not indices:
+                            continue
+                        target = targets.get(topic) or 1
+                        read = sum(1 for i in indices if i in read_indices)
+                        topic_pct += min(1.0, read / target) / total_topics
+                    pct = round(topic_pct * 100)
+                    label = f"Reviewing coverage — {len(listed_topics)}/{total_topics} topics"
+                    try:
+                        await on_agent_progress(pct, label)
+                    except Exception:
+                        pass
+
+            trace["tool_calls"].append({
+                "t": round(time.time(), 1),
+                "turn": _turn,
+                "tool": tool_name,
+                "input": {k: v for k, v in tool_input.items() if k != "markdown_content"},
+                "result_chars": len(content_str),
+            })
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": _cap_tool_result(content_str),
+            })
+
+        if tool_results:
+            messages.append({"role": "user", "content": tool_results})
+
+    if not beat_book_done:
+        _finish_trace()
+        print(f"[agent] loop exited without writing beat book "
+              f"(turn count exhausted or stop_reason mismatch). "
+              f"listed_topics={listed_topics}, read={len(read_indices)}", flush=True)
+        await on_message(
+            "⚠️ Agent stopped before producing a beat book. "
+            "Try again, or check the server logs."
+        )

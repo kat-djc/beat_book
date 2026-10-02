@@ -1,0 +1,551 @@
+"""
+pipeline.py
+-----------
+Embedding + clustering + topic-labeling pipeline.
+Reusable module — called by the web app after file upload.
+
+Returns a PipelineResult with stories, topics, and helper lookups.
+"""
+
+import json
+import logging
+import re
+import time
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Tuple, Callable
+from tqdm import tqdm
+import numpy as np
+
+# Type for progress callbacks: (step_name, progress_fraction 0.0–1.0, detail_text)
+ProgressCallback = Callable[[str, float, str], None]
+
+import umap
+import hdbscan
+
+from chat_provider import (
+    ChatProvider,
+    ChatRateLimitError,
+    RATE_LIMIT_MAX_RETRIES,
+    retry_pause,
+)
+from embed_client import EmbedClient
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+
+SAMPLE_SIZE_FOR_LABEL = 8
+# Ceiling for hosted providers (fast per-call, so fewer/bigger requests is
+# better). Actually applied size is min(this, client.batch_size) — a local/
+# CPU-bound provider like Ollama caps itself much lower (see embed_client.py)
+# so no single call blocks long enough to stall the progress it's reported
+# on (app.py's /process SSE heartbeat guards the same failure mode too).
+EMBED_BATCH_SIZE = 100
+# Labels are 2–5 words; 256 leaves plenty of room with extended thinking off.
+LABEL_MAX_TOKENS = 256
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RESULT DATACLASS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class PipelineResult:
+    """Everything the agent needs to work with the uploaded stories."""
+    stories: List[dict]                          # original story dicts
+    topics: Dict[str, List[int]]                 # topic_label → [story indices]
+    story_topics: List[List[str]]                # per-story list of topic labels
+    broad_topics: Dict[str, List[int]]           # broad topic → [story indices]
+    specific_topics: Dict[str, List[int]]        # specific topic → [story indices]
+    # When set, the agent may only see these story indices (the stories in the
+    # reporter's selected topics). None means the whole corpus is in scope.
+    allowed_indices: Optional[frozenset] = None
+
+    def in_scope(self, idx: int) -> bool:
+        return self.allowed_indices is None or idx in self.allowed_indices
+
+    def topic_summary(self) -> str:
+        """Human-readable summary of the broad topics the agent should explore."""
+        lines = ["## Topics"]
+        for label, indices in sorted(self.broad_topics.items(), key=lambda x: -len(x[1])):
+            lines.append(f"  - **{label}** ({len(indices)} stories)")
+        return "\n".join(lines)
+
+    def get_story(self, idx: int) -> Optional[dict]:
+        if 0 <= idx < len(self.stories) and self.in_scope(idx):
+            return self.stories[idx]
+        return None
+
+    def search_stories(self, query: str, max_results: int = 20) -> List[dict]:
+        q = query.lower()
+        results = []
+        for i, s in enumerate(self.stories):
+            if not self.in_scope(i):
+                continue
+            text = f"{s.get('title','')} {s.get('content','')}".lower()
+            if q in text:
+                results.append({"index": i, "title": s["title"], "date": s.get("date", "")})
+                if len(results) >= max_results:
+                    break
+        return results
+
+    def stories_for_topic(self, topic: str) -> List[dict]:
+        indices = self.topics.get(topic, [])
+        return [
+            {"index": i, "title": self.stories[i]["title"], "date": self.stories[i].get("date", "")}
+            for i in indices
+        ]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _story_to_text(story: dict) -> str:
+    title   = story.get("title", "")
+    content = story.get("content", "")
+    section = ""
+    for line in content.splitlines()[:10]:
+        stripped = line.strip()
+        if "section:" in stripped.lower():
+            section = stripped
+            break
+    words   = content.split()
+    snippet = " ".join(words[:400])
+    parts   = [p for p in [title, section, snippet] if p]
+    return "\n\n".join(parts)
+
+
+def _embed_batch(client: EmbedClient, texts: List[str],
+                  on_progress: Optional[ProgressCallback] = None) -> np.ndarray:
+    all_vectors = []
+    total = len(texts)
+    batch_size = min(EMBED_BATCH_SIZE, getattr(client, "batch_size", EMBED_BATCH_SIZE))
+    for i in tqdm(range(0, total, batch_size), desc="Embedding"):
+        chunk = texts[i : i + batch_size]
+        vecs = client.embed(chunk)
+        all_vectors.extend(vecs)
+        if on_progress:
+            done = min(i + batch_size, total)
+            on_progress("embedding", done / total, f"Embedded {done}/{total} stories…")
+    return np.array(all_vectors, dtype=np.float32)
+
+
+def _load_or_embed(client: EmbedClient, texts: List[str],
+                    on_progress: Optional[ProgressCallback] = None) -> np.ndarray:
+    """Embed the stories. Repeat runs on the same stories are served from
+    the embedding client's disk cache (embed_cache.py)."""
+    print(f"Embedding {len(texts)} stories…")
+    return _embed_batch(client, texts, on_progress)
+
+
+def _umap_params(n: int) -> dict:
+    n_components = min(15, max(5, n // 40))
+    n_neighbors  = min(30, max(5, int(n ** 0.55)))
+    return {"n_components": n_components, "n_neighbors": n_neighbors}
+
+
+def _cluster_sizes(n: int) -> Tuple[int, int]:
+    broad    = max(8, n // 6)
+    specific = max(4, n // 20)
+    return broad, specific
+
+
+def _reduce(vectors: np.ndarray) -> np.ndarray:
+    params = _umap_params(len(vectors))
+    print(f"UMAP (n_components={params['n_components']}, n_neighbors={params['n_neighbors']})…")
+
+    def _make_reducer(init: str):
+        return umap.UMAP(
+            n_components=params["n_components"],
+            n_neighbors=params["n_neighbors"],
+            min_dist=0.0,
+            metric="cosine",
+            random_state=42,
+            init=init,
+        )
+
+    # Newer scipy can raise `Cannot use scipy.linalg.eigh for sparse A with
+    # k >= N` inside UMAP's default spectral init when the kNN graph has few
+    # connected components. Fall back to pca → random if that happens.
+    for init in ("spectral", "pca", "random"):
+        try:
+            return _make_reducer(init).fit_transform(vectors)
+        except TypeError as e:
+            if "eigh" not in str(e) and "k >= N" not in str(e):
+                raise
+            print(f"UMAP init={init!r} hit scipy eigh bug; retrying…")
+    raise RuntimeError("UMAP failed with every init strategy")
+
+
+def _cluster(reduced: np.ndarray, min_cluster_size: int, broad: bool = False):
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=max(2, min_cluster_size // 2) if broad else 2,
+        metric="euclidean",
+        cluster_selection_method="leaf" if broad else "eom",
+        prediction_data=True,
+    )
+    labels = clusterer.fit_predict(reduced)
+    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+    n_noise    = int((labels == -1).sum())
+    print(f"  → {n_clusters} clusters, {n_noise} noise (min_cluster_size={min_cluster_size})")
+    return labels, clusterer
+
+
+def _assign_outliers(reduced: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    noise_mask = labels == -1
+    if not noise_mask.any():
+        return labels
+    labels          = labels.copy()
+    unique_clusters = [c for c in np.unique(labels) if c != -1]
+    if not unique_clusters:
+        labels[:] = 0
+        return labels
+    cluster_means = np.stack([reduced[labels == c].mean(axis=0) for c in unique_clusters])
+    for idx in np.where(noise_mask)[0]:
+        dists = np.linalg.norm(cluster_means - reduced[idx], axis=1)
+        labels[idx] = unique_clusters[int(dists.argmin())]
+    return labels
+
+
+# Labels are requested through a forced tool call, which the Anthropic API
+# answers with structured input and Ollama answers under a JSON-schema
+# constraint. Asking for bare text or a JSON object in prose broke with
+# reasoning models (GLM on Ollama): they wrote out their deliberation,
+# the JSON parse failed, and the fallback returned that deliberation,
+# cut off mid-sentence, as the topic label.
+_LABEL_INSTRUCTIONS = (
+    "Each label is a concise topic label of 2 to 5 words describing the SUBJECT "
+    "MATTER the articles share. Focus on WHAT happens, not WHERE: avoid labels like "
+    "'Chicago news', 'local community news' or 'Illinois news' unless the geography "
+    "itself is the distinguishing feature (e.g. 'Lake Michigan environment'). Good "
+    "labels: 'High School Basketball', 'City Budget Disputes', 'Immigration Policy', "
+    "'Crime and Sentencing', 'City Council', 'Transit'. Give only the label, with no "
+    "explanation."
+)
+
+_ONE_LABEL_TOOL = {
+    "name": "name_topic",
+    "description": "Give the topic label for this cluster of articles.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"label": {"type": "string", "description": "2 to 5 words."}},
+        "required": ["label"],
+    },
+}
+
+_ALL_LABELS_TOOL = {
+    "name": "name_topics",
+    "description": "Give a topic label for every cluster.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "labels": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "cluster": {"type": "integer"},
+                        "label": {"type": "string", "description": "2 to 5 words."},
+                    },
+                    "required": ["cluster", "label"],
+                },
+            }
+        },
+        "required": ["labels"],
+    },
+}
+
+MAX_LABEL_WORDS = 6
+MAX_LABEL_CHARS = 60
+_LABEL_STOPWORDS = set("""a an and are as at be by for from has have he her his in into is it its
+of on or over says she that the their they this to was were will with after amid about new
+more than what who how why when where says said""".split())
+
+
+def clean_label(text: object) -> Optional[str]:
+    """A usable topic label from a model's answer, or None.
+
+    A label is at most MAX_LABEL_WORDS words and MAX_LABEL_CHARS
+    characters on one line. When the answer is prose (a model reasoning out
+    loud), the last short quoted phrase in it is taken, since reasoning
+    models usually quote the label they settle on."""
+    if not isinstance(text, str):
+        return None
+    t = re.sub(r"\s+", " ", text).strip().strip("*").strip().strip('"\'\u201c\u201d').strip()
+    t = re.sub(r"^(?:label|topic)\s*:\s*", "", t, flags=re.I).rstrip(".").strip()
+    if t and len(t) <= MAX_LABEL_CHARS and len(t.split()) <= MAX_LABEL_WORDS:
+        return t
+    quoted = [q.strip() for q in re.findall(r"[\"\u201c]([^\"\u201c\u201d\n]{3,60})[\"\u201d]", text)]
+    quoted = [q for q in quoted if len(q.split()) <= MAX_LABEL_WORDS]
+    return quoted[-1] if quoted else None
+
+
+def _fallback_label(stories: List[dict], indices: List[int]) -> str:
+    """A label from the cluster's headlines when the model gave none that
+    works: up to three words that recur across its headlines, favoring
+    capitalized words (names, agencies) over verbs like "faces"."""
+    counts: Dict[str, float] = {}
+    shown: Dict[str, str] = {}
+    for i in indices:
+        words = re.findall(r"[A-Za-z][A-Za-z'-]{2,}", stories[i].get("title", ""))
+        for pos, w in enumerate(words):
+            k = w.lower().removesuffix("'s")
+            if k in _LABEL_STOPWORDS:
+                continue
+            capitalized = w[0].isupper() and pos > 0     # the first word is capitalized anyway
+            counts[k] = counts.get(k, 0) + 1 + (0.5 if capitalized else 0)
+            if capitalized or k not in shown:
+                shown[k] = w.removesuffix("'s") if w[0].isupper() else w.capitalize()
+    ranked = sorted(counts, key=lambda k: (-counts[k], k))
+    recurring = [k for k in ranked if counts[k] >= 2]
+    top = (recurring if len(recurring) >= 2 else ranked)[:3]
+    return " ".join(shown[k] for k in top) or "Other Stories"
+
+
+def _tool_input(resp) -> Optional[dict]:
+    for block in getattr(resp, "content", []) or []:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            data = block.get("input")
+            if isinstance(data, str):
+                try:
+                    data = json.loads(data)
+                except json.JSONDecodeError:
+                    return None
+            return data if isinstance(data, dict) else None
+    return None
+
+
+def _call_labeler(provider: ChatProvider, prompt: str, tool: dict, max_tokens: int):
+    for rl_attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            return provider.create(
+                model=provider.label_model,
+                system="",
+                messages=[{"role": "user", "content": prompt}],
+                tools=[tool],
+                tool_choice={"type": "tool", "name": tool["name"]},
+                max_tokens=max_tokens,
+            )
+        except ChatRateLimitError as e:
+            if rl_attempt >= RATE_LIMIT_MAX_RETRIES:
+                raise
+            pause = retry_pause(rl_attempt, e)
+            logging.warning("Topic labeling rate limited; waiting %.0fs (attempt %d/%d).",
+                            pause, rl_attempt + 1, RATE_LIMIT_MAX_RETRIES)
+            time.sleep(pause)
+
+
+def _label_cluster(provider: ChatProvider, stories: List[dict], indices: List[int], reduced: np.ndarray) -> str:
+    cluster_vecs = reduced[indices]
+    centroid     = cluster_vecs.mean(axis=0)
+    dists        = np.linalg.norm(cluster_vecs - centroid, axis=1)
+    order        = np.argsort(dists)
+    sampled      = [indices[i] for i in order[:SAMPLE_SIZE_FOR_LABEL]]
+
+    snippets = []
+    for i in sampled:
+        s = stories[i]
+        words   = s.get("content", "").split()
+        excerpt = " ".join(words[10:40])
+        snippets.append(f"• {s['title']} — {excerpt}")
+
+    prompt = (
+        "You are labeling a cluster of news articles from a local newspaper.\n"
+        "Below are its most representative headlines and excerpts.\n\n"
+        + "\n".join(snippets)
+        + f"\n\nCall name_topic with the label. {_LABEL_INSTRUCTIONS}"
+    )
+    try:
+        resp = _call_labeler(provider, prompt, _ONE_LABEL_TOOL, LABEL_MAX_TOKENS)
+    except ChatRateLimitError:
+        raise
+    except Exception as e:     # a failed label call must not fail the pipeline
+        logging.warning("Topic label call failed (%s); using headline words.", e)
+        return _fallback_label(stories, indices)
+    data = _tool_input(resp) or {}
+    return (clean_label(data.get("label")) or clean_label(getattr(resp, "text", ""))
+            or _fallback_label(stories, indices))
+
+
+def _cluster_snippets(stories, indices, reduced):
+    cluster_vecs = reduced[indices]
+    centroid     = cluster_vecs.mean(axis=0)
+    dists        = np.linalg.norm(cluster_vecs - centroid, axis=1)
+    order        = np.argsort(dists)
+    sampled      = [indices[i] for i in order[:SAMPLE_SIZE_FOR_LABEL]]
+    out = []
+    for i in sampled:
+        s = stories[i]
+        words   = s.get("content", "").split()
+        excerpt = " ".join(words[10:40])
+        out.append(f"  \u2022 {s['title']} \u2014 {excerpt}")
+    return "\n".join(out)
+
+
+def _label_all(provider: ChatProvider, stories, labels, reduced, level_name, on_progress=None):
+    """Label all clusters at this level in a single LLM call.
+
+    Clusters the batched call leaves unlabeled, or labels with something
+    unusable, are labeled one at a time. Labels are made distinct so two
+    clusters never merge under one name."""
+    unique = sorted(c for c in np.unique(labels) if c != -1)
+    print(f"Labeling {len(unique)} {level_name} clusters\u2026")
+    if not unique:
+        return {}
+
+    blocks = []
+    for cid in unique:
+        indices = list(np.where(labels == cid)[0])
+        blocks.append(f"Cluster {cid}:\n{_cluster_snippets(stories, indices, reduced)}")
+    prompt = (
+        "You are labeling clusters of news articles from a local newspaper.\n"
+        f"There are {len(unique)} clusters below. Each cluster shows its most "
+        "representative headlines and excerpts.\n\n"
+        + "\n\n".join(blocks)
+        + f"\n\nCall name_topics with one label for every cluster id. {_LABEL_INSTRUCTIONS}"
+    )
+
+    if on_progress:
+        on_progress(f"labeling_{level_name}", 0.0,
+                    f"Labeling {len(unique)} {level_name} topics in one batch\u2026")
+
+    result: Dict[int, str] = {}
+    try:
+        resp = _call_labeler(provider, prompt, _ALL_LABELS_TOOL, min(2048, 128 + 32 * len(unique)))
+        for item in (_tool_input(resp) or {}).get("labels", []) or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                cid = int(item.get("cluster"))
+            except (TypeError, ValueError):
+                continue
+            label = clean_label(item.get("label"))
+            if cid in unique and label:
+                result[cid] = label
+    except ChatRateLimitError:
+        raise
+    except Exception as e:
+        logging.warning("Batch topic labeling failed (%s); labeling clusters one at a time.", e)
+
+    missing = [cid for cid in unique if cid not in result]
+    if missing:
+        logging.warning("Batch label missed %d/%d clusters; filling individually.",
+                        len(missing), len(unique))
+        for cid in missing:
+            indices = list(np.where(labels == cid)[0])
+            result[cid] = _label_cluster(provider, stories, indices, reduced)
+
+    # Distinct names: stories are grouped by label downstream, so a repeated
+    # label would silently merge two clusters.
+    seen: Dict[str, int] = {}
+    for cid in unique:
+        key = result[cid].lower()
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > 1:
+            result[cid] = f"{result[cid]} ({seen[key]})"
+
+    if on_progress:
+        on_progress(f"labeling_{level_name}", 1.0,
+                    f"Labeled {len(unique)}/{len(unique)} {level_name} topics")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PUBLIC API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_pipeline(stories: List[dict], embed_client: EmbedClient, chat_provider: ChatProvider,
+                 on_progress: Optional[ProgressCallback] = None) -> PipelineResult:
+    """Full pipeline: embed \u2192 reduce \u2192 cluster \u2192 label \u2192 return PipelineResult."""
+    def _p(step, frac, detail=""):
+        if on_progress:
+            on_progress(step, frac, detail)
+
+    embed_clt = embed_client
+
+    _p("embedding", 0.0, f"Generating embeddings for {len(stories)} stories\u2026")
+    texts   = [_story_to_text(s) for s in stories]
+    vectors = _load_or_embed(embed_clt, texts, on_progress)
+    _p("embedding", 1.0, "Embeddings complete")
+
+    # Small corpora skip UMAP+HDBSCAN: density-based clustering is meaningless
+    # below ~8 stories, and UMAP itself rejects n_neighbors >= n_samples.
+    # The agent only needs at least one topic with all stories.
+    if len(stories) < 8:
+        _p("reducing", 1.0, "Skipping reduction (small corpus)")
+        _p("clustering", 1.0, "Skipping clustering (small corpus)")
+        _p("labeling", 0.0, "Labeling combined topic\u2026")
+        all_indices = list(range(len(stories)))
+        label = _label_cluster(chat_provider, stories, all_indices, vectors)
+        topics = {label: all_indices}
+        story_topics = [[label] for _ in stories]
+        _p("labeling", 1.0, "Done")
+        return PipelineResult(
+            stories=stories,
+            topics=topics,
+            story_topics=story_topics,
+            broad_topics=topics,
+            specific_topics=topics,
+        )
+
+    _p("reducing", 0.0, "Reducing dimensions\u2026")
+    reduced = _reduce(vectors)
+    _p("reducing", 1.0, "Dimensionality reduction complete")
+
+    broad_min, specific_min = _cluster_sizes(len(stories))
+    print(f"Cluster sizes: broad_min={broad_min}, specific_min={specific_min}")
+
+    _p("clustering", 0.0, "Clustering stories\u2026")
+    # Progressively increase min_cluster_size until we get \u2264max_broad_topics
+    # broad topics. The range always includes at least broad_min itself, so a
+    # small corpus (where len(stories)//2 <= broad_min) still gets one attempt.
+    max_broad_topics = max(3, len(stories) // 15)
+    attempt_stop = max(broad_min + 1, len(stories) // 2)
+    for attempt_min in range(broad_min, attempt_stop, 2):
+        broad_labels, _ = _cluster(reduced, attempt_min, broad=True)
+        broad_labels = _assign_outliers(reduced, broad_labels)
+        n_broad = len(set(broad_labels))
+        if n_broad <= max_broad_topics:
+            break
+    _p("clustering", 0.5, f"Broad clusters found ({n_broad} topics)")
+
+    spec_labels, _   = _cluster(reduced, specific_min, broad=False)
+    spec_labels       = _assign_outliers(reduced, spec_labels)
+    _p("clustering", 1.0, "All clusters found")
+
+    _p("labeling", 0.0, "Labeling topics with LLM\u2026")
+    broad_map = _label_all(chat_provider, stories, broad_labels, reduced, "broad",
+                           lambda s, f, d: _p("labeling", f * 0.4, d))
+    spec_map  = _label_all(chat_provider, stories, spec_labels,  reduced, "specific",
+                           lambda s, f, d: _p("labeling", 0.4 + f * 0.6, d))
+
+    # Build lookup dicts
+    broad_topics    = {}
+    specific_topics = {}
+    all_topics      = {}
+    story_topics    = []
+
+    for i in range(len(stories)):
+        bt = broad_map.get(int(broad_labels[i]), "Uncategorized")
+        st = spec_map.get(int(spec_labels[i]),   "Uncategorized")
+
+        broad_topics.setdefault(bt, []).append(i)
+        specific_topics.setdefault(st, []).append(i)
+        all_topics.setdefault(bt, [])
+        all_topics.setdefault(st, [])
+        if i not in all_topics[bt]:
+            all_topics[bt].append(i)
+        if i not in all_topics[st]:
+            all_topics[st].append(i)
+
+        story_topics.append([bt])
+
+    return PipelineResult(
+        stories=stories,
+        topics=broad_topics,
+        story_topics=story_topics,
+        broad_topics=broad_topics,
+        specific_topics=specific_topics,
+    )
